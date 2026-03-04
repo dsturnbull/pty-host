@@ -626,10 +626,12 @@ fn cmd_list() {
         return;
     }
     for (id, path) in &sessions {
-        let status = match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => "alive",
-            Err(_) => "stale",
-        };
+        // Don't connect to the socket — that triggers a full handshake
+        // (READY + Snapshot + ReplayDone) in blocking mode on the session
+        // side, which hangs if nobody reads from the client end.
+        // The socket file is removed on clean shutdown, so existence is a
+        // reasonable liveness signal.
+        let status = if path.exists() { "alive" } else { "stale" };
         println!("{id}  {} ({status})", path.display());
     }
 }
