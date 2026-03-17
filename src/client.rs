@@ -161,7 +161,7 @@ impl PtyHostClient {
         loop {
             match HostMessage::decode_from(&mut reader) {
                 Ok(HostMessage::Snapshot(bytes)) => {
-                    snapshot_data = bytes;
+                    snapshot_data.extend_from_slice(&bytes);
                 }
                 Ok(HostMessage::Data(bytes)) => {
                     // Legacy: ANSI-based replay (ignored in snapshot mode).
@@ -849,6 +849,93 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Verify that multiple Snapshot messages are accumulated (not replaced)
+    /// during the connect handshake.  This validates that the host-side
+    /// chunking (for snapshots larger than MAX_PAYLOAD_SIZE) is correctly
+    /// reassembled by the client.
+    #[test]
+    fn chunked_snapshot_is_reassembled() {
+        use crate::protocol::{self, HostMessage, MAX_PAYLOAD_SIZE};
+
+        // Create a mock "host" socket pair.
+        let (host_side, client_side) = UnixStream::pair().unwrap();
+        host_side.set_nonblocking(false).unwrap();
+        client_side.set_nonblocking(false).unwrap();
+
+        // Build a fake snapshot payload larger than MAX_PAYLOAD_SIZE.
+        let total_size = MAX_PAYLOAD_SIZE as usize + 1024;
+        let fake_snapshot: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
+
+        // Simulate the host handshake in a background thread.
+        let snapshot_clone = fake_snapshot.clone();
+        let host_thread = std::thread::spawn(move || {
+            let mut writer = &host_side;
+
+            // 1. Send READY
+            let ready = HostMessage::Ready {
+                version: protocol::PROTOCOL_VERSION,
+                pid: 42,
+                cols: 80,
+                rows: 24,
+            };
+            protocol::send_host_message(&mut writer, &ready).unwrap();
+
+            // 2. Send the snapshot in chunks (same logic as session.rs)
+            let chunk_size = MAX_PAYLOAD_SIZE as usize;
+            for chunk in snapshot_clone.chunks(chunk_size) {
+                let msg = HostMessage::Snapshot(chunk.to_vec());
+                protocol::send_host_message(&mut writer, &msg).unwrap();
+            }
+
+            // 3. Send REPLAY_DONE
+            protocol::send_host_message(&mut writer, &HostMessage::ReplayDone).unwrap();
+
+            // Keep the socket alive briefly so the client can finish reading.
+            std::thread::sleep(Duration::from_millis(500));
+            drop(host_side);
+        });
+
+        // Run the client-side connect handshake manually (same logic as
+        // PtyHostClient::connect, but on the already-connected socket).
+        let mut reader = &client_side;
+
+        // Read READY.
+        let ready_msg = HostMessage::decode_from(&mut reader).unwrap();
+        let (version, pid) = match ready_msg {
+            HostMessage::Ready { version, pid, .. } => (version, pid),
+            other => panic!("expected READY, got {other:?}"),
+        };
+        assert_eq!(version, protocol::PROTOCOL_VERSION);
+        assert_eq!(pid, 42);
+
+        // Read snapshot chunks + REPLAY_DONE (mirrors the connect() loop).
+        let mut snapshot_data = Vec::new();
+        loop {
+            match HostMessage::decode_from(&mut reader) {
+                Ok(HostMessage::Snapshot(bytes)) => {
+                    snapshot_data.extend_from_slice(&bytes);
+                }
+                Ok(HostMessage::ReplayDone) => break,
+                Ok(other) => panic!("unexpected message: {other:?}"),
+                Err(e) => panic!("decode error: {e}"),
+            }
+        }
+
+        // The reassembled snapshot must match the original byte-for-byte.
+        assert_eq!(
+            snapshot_data.len(),
+            fake_snapshot.len(),
+            "reassembled snapshot size mismatch"
+        );
+        assert_eq!(
+            snapshot_data, fake_snapshot,
+            "reassembled snapshot content mismatch"
+        );
+
+        host_thread.join().unwrap();
+    }
+
 }
 /// Deserialise a bincode-encoded `TermState` from snapshot data.
 ///

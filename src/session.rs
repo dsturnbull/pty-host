@@ -350,12 +350,16 @@ impl Session {
                                     snapshot.len()
                                 );
                                 if !snapshot.is_empty() {
-                                    let snapshot_msg = HostMessage::Snapshot(snapshot);
-                                    if let Err(e) = crate::protocol::send_host_message(
-                                        &mut writer,
-                                        &snapshot_msg,
-                                    ) {
-                                        log::warn!("Failed to send snapshot to client: {e}");
+                                    let chunk_size = MAX_PAYLOAD_SIZE as usize;
+                                    for chunk in snapshot.chunks(chunk_size) {
+                                        let snapshot_msg = HostMessage::Snapshot(chunk.to_vec());
+                                        if let Err(e) = crate::protocol::send_host_message(
+                                            &mut writer,
+                                            &snapshot_msg,
+                                        ) {
+                                            log::warn!("Failed to send snapshot chunk to client: {e}");
+                                            break;
+                                        }
                                     }
                                 }
 
