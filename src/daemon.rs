@@ -631,7 +631,7 @@ fn cmd_list() {
 
     for (id, path) in &sessions {
         if !path.exists() {
-            println!("stale	{id}	");
+            println!("stale	{id}		");
             continue;
         }
 
@@ -639,11 +639,12 @@ fn cmd_list() {
         match proc_info.get(&id_str) {
             Some(info) => {
                 let state = if info.has_client { "attached" } else { "detached" };
-                println!("{state}	{id}	{}", info.cwd.as_deref().unwrap_or(""));
+                let started = info.started.as_deref().unwrap_or("");
+                println!("{state}	{id}	{started}	{}", info.cwd.as_deref().unwrap_or(""));
             }
             None => {
                 // Socket exists but no process found — zombie socket.
-                println!("stale	{id}	");
+                println!("stale	{id}		");
             }
         }
     }
@@ -655,6 +656,8 @@ struct PtyHostProcInfo {
     cwd: Option<String>,
     /// Whether a client is currently connected (accepted socket exists).
     has_client: bool,
+    /// Process start time (from ps lstart), e.g. "2026-03-16 21:08".
+    started: Option<String>,
 }
 
 /// Query the OS for all running pty-host processes and determine their
@@ -677,7 +680,7 @@ fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostPr
     // Step 1: Get all pty-host PIDs, their session UUIDs, and --cwd values
     // from `ps`.
     let ps_output = match std::process::Command::new("ps")
-        .args(["-eo", "pid,args"])
+        .args(["-eo", "pid,lstart,args"])
         .output()
     {
         Ok(o) => o,
@@ -685,37 +688,38 @@ fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostPr
     };
     let ps_text = String::from_utf8_lossy(&ps_output.stdout);
 
-    // Map PID → (session_id, cwd)
-    let mut pid_info: HashMap<String, (String, Option<String>)> = HashMap::new();
+    // Map PID → (session_id, cwd, started)
+    let mut pid_info: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
 
     for line in ps_text.lines() {
         let line = line.trim();
         if !line.contains("pty-host") || !line.contains("--session") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
-        if parts.len() < 2 {
+        // Format: PID LSTART(5 fields) ARGS...
+        // e.g.: "1234 Mon 16 Mar 21:08:00 2026 /path/to/pty-host --session ..."
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 {
             continue;
         }
-        let pid = parts[0].trim().to_string();
-        let args = parts[1];
+        let pid = fields[0].to_string();
+        // lstart is 5 fields: DOW DD MON HH:MM:SS YYYY
+        let started = format!("{} {} {} {}", fields[5], fields[3], fields[2], fields[4]);
 
         // Extract --session UUID
-        let session_id = args
-            .split_whitespace()
-            .zip(args.split_whitespace().skip(1))
-            .find(|(k, _)| *k == "--session")
-            .map(|(_, v)| v.to_string());
+        let session_id = fields[6..]
+            .windows(2)
+            .find(|w| w[0] == "--session")
+            .map(|w| w[1].to_string());
 
         // Extract --cwd path
-        let cwd = args
-            .split_whitespace()
-            .zip(args.split_whitespace().skip(1))
-            .find(|(k, _)| *k == "--cwd")
-            .map(|(_, v)| v.to_string());
+        let cwd = fields[6..]
+            .windows(2)
+            .find(|w| w[0] == "--cwd")
+            .map(|w| w[1].to_string());
 
         if let Some(sid) = session_id {
-            pid_info.insert(pid, (sid, cwd));
+            pid_info.insert(pid, (sid, cwd, Some(started)));
         }
     }
 
@@ -738,12 +742,13 @@ fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostPr
         Ok(o) => o,
         Err(_) => {
             // lsof unavailable — fall back to showing everything as "detached".
-            for (_, (sid, cwd)) in &pid_info {
+            for (_, (sid, cwd, started)) in &pid_info {
                 result.insert(
                     sid.clone(),
                     PtyHostProcInfo {
                         cwd: cwd.clone(),
                         has_client: false,
+                        started: started.clone(),
                     },
                 );
             }
@@ -770,7 +775,7 @@ fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostPr
     }
 
     // Step 3: Assemble results.
-    for (pid, (sid, cwd)) in &pid_info {
+    for (pid, (sid, cwd, started)) in &pid_info {
         let sock_count = sock_counts.get(pid).copied().unwrap_or(0);
         // 1 .sock fd = listener only (detached)
         // 2+ .sock fds = listener + accepted client (attached)
@@ -779,6 +784,7 @@ fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostPr
             PtyHostProcInfo {
                 cwd: cwd.clone(),
                 has_client: sock_count >= 2,
+                started: started.clone(),
             },
         );
     }
