@@ -631,7 +631,7 @@ fn cmd_list() {
 
     for (id, path) in &sessions {
         if !path.exists() {
-            println!("{id}  (stale)");
+            println!("stale	{id}	");
             continue;
         }
 
@@ -639,11 +639,11 @@ fn cmd_list() {
         match proc_info.get(&id_str) {
             Some(info) => {
                 let state = if info.has_client { "attached" } else { "detached" };
-                println!("{id}  {} ({state})", info.cwd.as_deref().unwrap_or("?"));
+                println!("{state}	{id}	{}", info.cwd.as_deref().unwrap_or(""));
             }
             None => {
                 // Socket exists but no process found — zombie socket.
-                println!("{id}  (stale)");
+                println!("stale	{id}	");
             }
         }
     }
