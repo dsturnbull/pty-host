@@ -625,15 +625,165 @@ fn cmd_list() {
         println!("No active sessions.");
         return;
     }
+
+    // Gather process info for all pty-host processes in one pass.
+    let proc_info = gather_pty_host_process_info();
+
     for (id, path) in &sessions {
-        // Don't connect to the socket — that triggers a full handshake
-        // (READY + Snapshot + ReplayDone) in blocking mode on the session
-        // side, which hangs if nobody reads from the client end.
-        // The socket file is removed on clean shutdown, so existence is a
-        // reasonable liveness signal.
-        let status = if path.exists() { "alive" } else { "stale" };
-        println!("{id}  {} ({status})", path.display());
+        if !path.exists() {
+            println!("{id}  (stale)");
+            continue;
+        }
+
+        let id_str = id.to_string();
+        match proc_info.get(&id_str) {
+            Some(info) => {
+                let state = if info.has_client { "attached" } else { "detached" };
+                println!("{id}  {} ({state})", info.cwd.as_deref().unwrap_or("?"));
+            }
+            None => {
+                // Socket exists but no process found — zombie socket.
+                println!("{id}  (stale)");
+            }
+        }
     }
+}
+
+/// Per-session info gathered from the OS process table and lsof.
+struct PtyHostProcInfo {
+    /// Working directory from --cwd argument.
+    cwd: Option<String>,
+    /// Whether a client is currently connected (accepted socket exists).
+    has_client: bool,
+}
+
+/// Query the OS for all running pty-host processes and determine their
+/// cwd and client-attached state.
+///
+/// Returns a map from session UUID string to process info.
+///
+/// **How client detection works:** each pty-host process has a Unix
+/// listener socket (the `.sock` file). When a client connects, `accept()`
+/// creates a second fd referencing the same path. So:
+/// - 1 `.sock` fd → no client (detached)
+/// - 2 `.sock` fds → client connected (attached)
+///
+/// We use `lsof -U` to count `.sock` references per PID.
+fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostProcInfo> {
+    use std::collections::HashMap;
+
+    let mut result: HashMap<String, PtyHostProcInfo> = HashMap::new();
+
+    // Step 1: Get all pty-host PIDs, their session UUIDs, and --cwd values
+    // from `ps`.
+    let ps_output = match std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return result,
+    };
+    let ps_text = String::from_utf8_lossy(&ps_output.stdout);
+
+    // Map PID → (session_id, cwd)
+    let mut pid_info: HashMap<String, (String, Option<String>)> = HashMap::new();
+
+    for line in ps_text.lines() {
+        let line = line.trim();
+        if !line.contains("pty-host") || !line.contains("--session") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let pid = parts[0].trim().to_string();
+        let args = parts[1];
+
+        // Extract --session UUID
+        let session_id = args
+            .split_whitespace()
+            .zip(args.split_whitespace().skip(1))
+            .find(|(k, _)| *k == "--session")
+            .map(|(_, v)| v.to_string());
+
+        // Extract --cwd path
+        let cwd = args
+            .split_whitespace()
+            .zip(args.split_whitespace().skip(1))
+            .find(|(k, _)| *k == "--cwd")
+            .map(|(_, v)| v.to_string());
+
+        if let Some(sid) = session_id {
+            pid_info.insert(pid, (sid, cwd));
+        }
+    }
+
+    if pid_info.is_empty() {
+        return result;
+    }
+
+    // Step 2: Use lsof to count .sock fd references per PID.
+    // We pass all PIDs at once to avoid N lsof invocations.
+    let pids_csv: String = pid_info
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let lsof_output = match std::process::Command::new("lsof")
+        .args(["-p", &pids_csv, "-U", "-F", "pn"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => {
+            // lsof unavailable — fall back to showing everything as "detached".
+            for (_, (sid, cwd)) in &pid_info {
+                result.insert(
+                    sid.clone(),
+                    PtyHostProcInfo {
+                        cwd: cwd.clone(),
+                        has_client: false,
+                    },
+                );
+            }
+            return result;
+        }
+    };
+    let lsof_text = String::from_utf8_lossy(&lsof_output.stdout);
+
+    // lsof -F pn output format:
+    //   p<PID>        — process header
+    //   n<NAME>       — fd name (socket path or ->0x...)
+    // Count how many times each PID has a line containing ".sock".
+    let mut sock_counts: HashMap<String, usize> = HashMap::new();
+    let mut current_pid = String::new();
+
+    for line in lsof_text.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            current_pid = pid.to_string();
+        } else if let Some(name) = line.strip_prefix('n') {
+            if name.contains(".sock") && !current_pid.is_empty() {
+                *sock_counts.entry(current_pid.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    // Step 3: Assemble results.
+    for (pid, (sid, cwd)) in &pid_info {
+        let sock_count = sock_counts.get(pid).copied().unwrap_or(0);
+        // 1 .sock fd = listener only (detached)
+        // 2+ .sock fds = listener + accepted client (attached)
+        result.insert(
+            sid.clone(),
+            PtyHostProcInfo {
+                cwd: cwd.clone(),
+                has_client: sock_count >= 2,
+            },
+        );
+    }
+
+    result
 }
 
 fn cmd_kill(session_id_str: &str) {
