@@ -182,6 +182,26 @@ impl PtyHostClient {
                     log::warn!("Unexpected message during replay: {other:?}");
                     break;
                 }
+                Err(protocol::DecodeError::PayloadTooLarge(len)) => {
+                    // Old host that doesn't chunk snapshots — drain the
+                    // oversized payload so we can continue reading the
+                    // ReplayDone sentinel that follows.
+                    log::warn!(
+                        "Oversized replay frame ({len} bytes), draining"
+                    );
+                    if let Err(e) = io::copy(
+                        &mut (&mut reader).take(len as u64),
+                        &mut io::sink(),
+                    ) {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!("failed to drain oversized frame: {e}"),
+                        ));
+                    }
+                    // The snapshot is lost, but the session is still usable
+                    // for live I/O — the grid will just start empty.
+                    continue;
+                }
                 Err(protocol::DecodeError::UnexpectedEof) => {
                     // Host closed before sending ReplayDone — use what we have.
                     break;

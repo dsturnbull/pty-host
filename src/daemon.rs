@@ -353,6 +353,23 @@ fn reader_loop(stream: UnixStream, running: &AtomicBool) {
             {
                 continue;
             }
+            Err(protocol::DecodeError::PayloadTooLarge(len)) => {
+                // The header was consumed but the payload bytes are still
+                // in the stream.  Drain them so we can continue reading
+                // subsequent messages (e.g. ReplayDone after an oversized
+                // Snapshot from an old host that doesn't chunk).
+                let _ = writeln!(
+                    io::stderr(),
+                    "[pty-host: skipping oversized frame, {len} bytes]"
+                );
+                if io::copy(
+                    &mut (&mut reader).take(len as u64),
+                    &mut io::sink(),
+                ).is_err() {
+                    break;
+                }
+                continue;
+            }
             Err(_) => break,
         };
 
