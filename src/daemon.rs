@@ -721,7 +721,17 @@ fn gather_pty_host_process_info() -> std::collections::HashMap<String, PtyHostPr
         }
         let pid = fields[0].to_string();
         // lstart is 5 fields: DOW DD MON HH:MM:SS YYYY
-        let started = format!("{} {} {} {}", fields[5], fields[3], fields[2], fields[4]);
+        // Reformat to ISO 8601: YYYY-MM-DDTHH:MM:SS
+        let mon = match fields[3] {
+            "Jan" => "01", "Feb" => "02", "Mar" => "03", "Apr" => "04",
+            "May" => "05", "Jun" => "06", "Jul" => "07", "Aug" => "08",
+            "Sep" => "09", "Oct" => "10", "Nov" => "11", "Dec" => "12",
+            _ => "00",
+        };
+        let started = format!(
+            "{}-{}-{:0>2}T{}",
+            fields[5], mon, fields[2], fields[4]
+        );
 
         // Extract --session UUID
         let session_id = fields[6..]
