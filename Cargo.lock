@@ -13,8 +13,8 @@ dependencies = [
 
 [[package]]
 name = "alacritty_terminal"
-version = "0.25.2-dev"
-source = "git+https://github.com/dsturnbull/alacritty?rev=da57ba29#da57ba298763d3b236d0a989871f070687b5eb32"
+version = "0.25.2"
+source = "git+https://github.com/dsturnbull/alacritty?rev=3e8aaa24#3e8aaa248d87ae7e57ef557bf068fbf49fc7047e"
 dependencies = [
  "base64",
  "bincode 2.0.1",
