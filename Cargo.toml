@@ -28,7 +28,7 @@ uuid = { version = "1", features = ["v4"] }
 bincode = "1"
 
 # Same PTY/IO stack as alacritty_terminal
-alacritty_terminal = { git = "https://github.com/dsturnbull/alacritty", rev = "4461ad27" }
+alacritty_terminal = { git = "https://github.com/dsturnbull/alacritty", rev = "da57ba29" }
 libc = "0.2"
 polling = "3.8.0"
 rustix-openpty = "0.2.0"
