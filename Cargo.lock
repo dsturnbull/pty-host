@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.25.2-dev"
-source = "git+https://github.com/dsturnbull/alacritty?rev=9022d270#9022d2707eee04abb53197e2ee6aa17312a18d15"
+source = "git+https://github.com/dsturnbull/alacritty?rev=4461ad27#4461ad27e065c12587737e649471c13f88284a38"
 dependencies = [
  "base64",
  "bincode 2.0.1",
