@@ -44,4 +44,4 @@ jiff = "0.2"
 [dev-dependencies]
 
 [patch.crates-io]
-alacritty_terminal = { git = "https://github.com/dsturnbull/alacritty", rev = "3e8aaa24" }
+alacritty_terminal = { git = "https://github.com/dsturnbull/alacritty", rev = "30f7f4fd" }
