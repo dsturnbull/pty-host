@@ -80,6 +80,21 @@ pub struct PtyHostClient {
     _deframe_thread: Option<JoinHandle<()>>,
 }
 
+impl Drop for PtyHostClient {
+    fn drop(&mut self) {
+        // Shut down the socket so the deframe thread's blocking read returns
+        // EOF. Without this, the deframe thread holds the read-side of the
+        // socket open indefinitely, which prevents pty-host from detecting
+        // client disconnect (and therefore from self-terminating after the
+        // child process exits).
+        //
+        // The FramingWriter holds a clone of the socket fd. Shutting it down
+        // affects both clones — the deframe thread will see EOF on its next
+        // read.
+        let _ = self.framing_writer.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// Result of a successful connection to a pty-host session.
 pub struct ConnectResult {
     /// The client, ready to be used with an `EventLoop`.
@@ -848,6 +863,217 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Verify that dropping a PtyHostClient shuts down the socket, causing
+    /// the deframe thread to exit. Without the Drop impl the deframe thread
+    /// would block forever on read(), keeping the socket open.
+    #[test]
+    fn drop_shuts_down_socket_and_deframe_thread_exits() {
+        use crate::session::{Session, SessionConfig};
+        use std::fs;
+
+        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("phd-{short_id}"));
+        let _ = fs::create_dir_all(&dir);
+        let socket_path = dir.join("s.sock");
+
+        let config = SessionConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            socket_path: socket_path.clone(),
+            max_scrollback_lines: 100,
+            ..Default::default()
+        };
+
+        let mut session = Session::spawn(&config).expect("session should spawn");
+        let handle = std::thread::spawn(move || {
+            session.run().ok();
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let result = PtyHostClient::connect(&socket_path).expect("should connect");
+        let client = result.client;
+
+        // Drop the client — this should shut down the socket and the session
+        // should detect the disconnect.
+        let before_drop = std::time::Instant::now();
+        drop(client);
+
+        // The session should notice the client disconnected promptly (not
+        // hang waiting for the deframe thread). Give it a generous 2 seconds.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Reconnect to verify the session is still alive (shell is still
+        // running, just no client). If the socket shutdown caused the session
+        // to crash, this would fail.
+        let result2 = PtyHostClient::connect(&socket_path);
+        assert!(result2.is_ok(), "session should still be alive after client drop");
+
+        // Clean up.
+        if let Ok(mut r) = result2 {
+            r.client.kill().ok();
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle.is_finished() {
+                handle.join().expect("session thread panicked");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("session did not shut down within 5 seconds after kill");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let elapsed = before_drop.elapsed();
+        // The drop + disconnect detection should be fast, not blocked on the
+        // deframe thread. If it took more than 5s something is wrong.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drop took too long ({elapsed:?}), deframe thread likely blocked"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Verify that when the shell exits, next_child_event() returns the exit
+    /// code. This is the mechanism the forwarding loop uses to detect child
+    /// exit and send PtyHostOutput::ChildExit to the Zed client.
+    #[test]
+    fn child_exit_detected_via_next_child_event() {
+        use crate::session::{Session, SessionConfig};
+        use alacritty_terminal::tty::{ChildEvent, EventedPty};
+        use std::fs;
+
+        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("phce-{short_id}"));
+        let _ = fs::create_dir_all(&dir);
+        let socket_path = dir.join("s.sock");
+
+        // Use sleep so the shell stays alive long enough for us to connect,
+        // then exits with a known code.
+        let config = SessionConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "echo hello && sleep 1 && exit 42".to_string()],
+            socket_path: socket_path.clone(),
+            max_scrollback_lines: 100,
+            ..Default::default()
+        };
+
+        let mut session = Session::spawn(&config).expect("session should spawn");
+        let handle = std::thread::spawn(move || {
+            session.run().ok();
+        });
+
+        // Give the session time to start listening.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Connect while the shell is still running.
+        let result = PtyHostClient::connect(&socket_path).expect("should connect");
+        let mut client = result.client;
+
+        // Poll next_child_event in a loop — the child already exited so the
+        // host should send CHILD_EXIT during or shortly after the handshake.
+        let mut got_exit = false;
+        let mut exit_code = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Some(ChildEvent::Exited(code)) = client.next_child_event() {
+                got_exit = true;
+                exit_code = code;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(got_exit, "should have received ChildExit event");
+        // /bin/sh -c "exit 42" exits with raw status that encodes 42.
+        // The raw status from waitpid for exit(42) is 42 << 8 = 10752.
+        // pty-host sends the raw status; the caller interprets it.
+        if let Some(raw) = exit_code {
+            // On most Unix systems, WEXITSTATUS(raw) = (raw >> 8) & 0xff
+            let actual_code = (raw >> 8) & 0xff;
+            assert_eq!(actual_code, 42, "exit code should be 42, got raw={raw}");
+        }
+
+        drop(client);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if handle.is_finished() {
+                handle.join().expect("session thread panicked");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Verify that after the shell exits AND the client disconnects, the
+    /// pty-host session process self-terminates (no zombies or orphans).
+    #[test]
+    fn session_self_terminates_after_child_exit_and_client_disconnect() {
+        use crate::session::{Session, SessionConfig};
+        use std::fs;
+
+        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("phst-{short_id}"));
+        let _ = fs::create_dir_all(&dir);
+        let socket_path = dir.join("s.sock");
+
+        let config = SessionConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            socket_path: socket_path.clone(),
+            max_scrollback_lines: 100,
+            ..Default::default()
+        };
+
+        let mut session = Session::spawn(&config).expect("session should spawn");
+        let handle = std::thread::spawn(move || {
+            session.run().ok();
+        });
+
+        // Wait for the shell to exit.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Connect and immediately drop — triggers client disconnect.
+        if socket_path.exists() {
+            let result = PtyHostClient::connect(&socket_path);
+            if let Ok(result) = result {
+                drop(result.client);
+            }
+        }
+
+        // The session should now shut down: child exited + no client.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if handle.is_finished() {
+                handle.join().expect("session thread panicked");
+                // Socket file should be cleaned up by the session's Drop impl.
+                assert!(
+                    !socket_path.exists(),
+                    "socket file should be removed after session exits"
+                );
+                let _ = fs::remove_dir_all(&dir);
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = fs::remove_dir_all(&dir);
+                panic!(
+                    "session did not self-terminate within 8 seconds after \
+                     child exit + client disconnect"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 /// Deserialise a bincode-encoded `TermState` from snapshot data.

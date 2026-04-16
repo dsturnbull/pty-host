@@ -122,7 +122,17 @@ fn init_logging(args: &[String]) {
 
 
 pub fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    main_with_args(args);
+}
+
+/// Entry point that accepts pre-parsed arguments (without the program name).
+///
+/// This is used when pty-host runs as a subcommand of another binary
+/// (e.g. `remote_server pty-host --session <UUID> ...` or
+/// `zed pty-host --session <UUID> ...`). The caller strips the program
+/// name and the `pty-host` literal, passing only the daemon flags.
+pub fn main_with_args(args: Vec<String>) {
     init_logging(&args);
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -153,7 +163,7 @@ pub fn main() {
         process::exit(0);
     }
 
-    let config = match parse_session_args(&args[1..]) {
+    let config = match parse_session_args(&args) {
         Ok(config) => config,
         Err(msg) => {
             eprintln!("error: {msg}");
