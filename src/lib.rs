@@ -59,26 +59,38 @@ pub struct SpawnConfig {
 ///
 /// Returns the socket path to connect to. The child process is detached
 /// and will outlive the caller.
+///
+/// The binary resolution strategy uses `current_exe()` with a `pty-host`
+/// subcommand argument. Both the `zed` and `remote_server` binaries handle
+/// this subcommand, so no separate `pty-host` binary needs to be deployed.
+/// If the current executable is already the standalone `pty-host` binary,
+/// the subcommand argument is omitted.
 pub fn spawn_host(config: &SpawnConfig) -> anyhow::Result<std::path::PathBuf> {
-    let pty_host_bin = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let dir = exe.parent()?;
-            let candidate = dir.join("pty-host");
-            candidate.exists().then_some(candidate)
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("pty-host"));
+    let current_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to determine current executable: {e}"))?;
+
+    // If the running binary IS the standalone pty-host, invoke it directly.
+    // Otherwise (zed, remote_server, etc.) use the `pty-host` subcommand.
+    let is_standalone = current_exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|name| name == "pty-host")
+        .unwrap_or(false);
 
     log::info!(
-        "spawn_host: binary={}, session={}, shell={:?}, args={:?}, cwd={:?}",
-        pty_host_bin.display(),
+        "spawn_host: exe={}, subcommand={}, session={}, shell={:?}, args={:?}, cwd={:?}",
+        current_exe.display(),
+        !is_standalone,
         config.session_id,
         config.shell_program.as_deref().unwrap_or("(system default)"),
         config.shell_args,
         config.working_directory,
     );
 
-    let mut cmd = std::process::Command::new(&pty_host_bin);
+    let mut cmd = std::process::Command::new(&current_exe);
+    if !is_standalone {
+        cmd.arg("pty-host");
+    }
 
     // Put pty-host in its own process group so signals sent to the parent's
     // process group (e.g. ^C / SIGINT) don't propagate to the shepherd.
@@ -109,8 +121,8 @@ pub fn spawn_host(config: &SpawnConfig) -> anyhow::Result<std::path::PathBuf> {
 
     let mut child = cmd.spawn().map_err(|error| {
         anyhow::anyhow!(
-            "failed to spawn pty-host at {}: {error}",
-            pty_host_bin.display()
+            "failed to spawn pty-host via {}: {error}",
+            current_exe.display()
         )
     })?;
     log::info!("spawn_host: pty-host spawned, pid={}", child.id());
@@ -130,8 +142,18 @@ pub fn spawn_host(config: &SpawnConfig) -> anyhow::Result<std::path::PathBuf> {
         reported_path.display()
     );
 
-    // Detach — it runs independently of the parent.
-    drop(child);
+    // Spawn a background thread to reap the child when it exits, preventing
+    // zombies. We can't just drop(child) because on Unix that doesn't call
+    // waitpid — the kernel keeps the zombie around until the parent reaps it.
+    std::thread::Builder::new()
+        .name(format!("pty-host-reaper-{}", config.session_id))
+        .spawn(move || {
+            match child.wait() {
+                Ok(status) => log::info!("pty-host process exited: {status}"),
+                Err(e) => log::warn!("failed to reap pty-host process: {e}"),
+            }
+        })
+        .ok();
 
     Ok(reported_path)
 }
