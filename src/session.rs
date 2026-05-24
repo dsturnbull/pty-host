@@ -97,6 +97,10 @@ pub struct Session {
     sigchld_id: signal_hook::SigId,
     /// Headless terminal emulator for state tracking and grid serialisation.
     headless: HeadlessTerminal,
+    /// Synthesises OSC 0 titles based on the foreground process group when
+    /// no program emits its own title (top, htop, vim, etc.). Quiesces
+    /// while a real OSC title is recent.
+    foreground_probe: crate::foreground::ForegroundProbe,
     /// Whether the child has exited.
     child_exited: bool,
     /// Raw exit status if the child has exited.
@@ -220,6 +224,7 @@ impl Session {
             sigchld_pipe: sigchld_receiver,
             sigchld_id: sigchld_id,
             headless: HeadlessTerminal::new(&config.initial_size, config.max_scrollback_lines),
+            foreground_probe: crate::foreground::ForegroundProbe::new(),
             child_exited: false,
             exit_status: None,
         })
@@ -435,10 +440,36 @@ impl Session {
                                     // state is always up-to-date for replay.
                                     self.headless.process(data);
 
+                                    // Sniff the outbound bytes for real OSC 0/1/2
+                                    // title sequences so we know whether to
+                                    // suppress synthetic titles.
+                                    self.foreground_probe.observe_outbound(data);
+
                                     // Queue for client if connected.
                                     if self.client.is_some() {
                                         let msg = HostMessage::Data(data.to_vec());
                                         client_write_queue.extend_from_slice(&msg.encode());
+
+                                        // Inject a synthetic OSC 0 if the
+                                        // foreground process changed and no real
+                                        // OSC was emitted recently. This piggies
+                                        // on the existing data stream — Zed's
+                                        // alacritty parser sees it identically
+                                        // to a program-emitted title.
+                                        let source = crate::foreground::PtyForegroundSource::new(
+                                            self.master_fd,
+                                        );
+                                        if let Some(synth) = self
+                                            .foreground_probe
+                                            .maybe_inject(&source)
+                                        {
+                                            // Feed through headless too so replay
+                                            // state matches what the client sees.
+                                            self.headless.process(&synth);
+                                            let msg = HostMessage::Data(synth);
+                                            client_write_queue
+                                                .extend_from_slice(&msg.encode());
+                                        }
 
                                         // If the queue is getting large, pause PTY
                                         // reads so the child process backs up

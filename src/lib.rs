@@ -39,6 +39,7 @@
 //! secure temporary directory equivalent).
 
 pub mod client;
+pub mod foreground;
 pub mod headless;
 pub mod protocol;
 pub mod session;
