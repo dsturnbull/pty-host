@@ -172,18 +172,7 @@ impl<C: Clock> ForegroundProbe<C> {
 }
 
 fn format_title(info: &ProcessInfo) -> String {
-    let cwd_name = info
-        .cwd
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    if cwd_name.is_empty() {
-        info.name.clone()
-    } else {
-        format!("{cwd_name} — {}", info.name)
-    }
+    info.name.clone()
 }
 
 fn synthesise_osc_title(title: &str) -> Vec<u8> {
@@ -450,31 +439,23 @@ mod tests {
     // ----- format_title tests -------------------------------------------
 
     #[test]
-    fn format_title_with_cwd_and_name() {
+    fn format_title_uses_process_name_only() {
+        // Title is just the process name. Cwd is intentionally omitted —
+        // the agent panel already shows the project as a separate label.
         let info = ProcessInfo {
             name: "vim".into(),
             cwd: Some(PathBuf::from("/Users/me/myproject")),
         };
-        assert_eq!(format_title(&info), "myproject — vim");
+        assert_eq!(format_title(&info), "vim");
     }
 
     #[test]
-    fn format_title_without_cwd_falls_back_to_name() {
+    fn format_title_without_cwd() {
         let info = ProcessInfo {
             name: "top".into(),
             cwd: None,
         };
         assert_eq!(format_title(&info), "top");
-    }
-
-    #[test]
-    fn format_title_with_root_cwd_falls_back_to_name() {
-        // file_name() returns None for "/", so cwd_name is empty.
-        let info = ProcessInfo {
-            name: "htop".into(),
-            cwd: Some(PathBuf::from("/")),
-        };
-        assert_eq!(format_title(&info), "htop");
     }
 
     // ----- synthesise_osc_title tests -----------------------------------
@@ -558,7 +539,7 @@ mod tests {
         let mut p = probe(clock);
 
         let out = p.maybe_inject(&source).expect("should inject");
-        assert_eq!(out, b"\x1b]0;myproject \xe2\x80\x94 vim\x07");
+        assert_eq!(out, b"\x1b]0;vim\x07");
     }
 
     #[test]
